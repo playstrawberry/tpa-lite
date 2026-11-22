@@ -245,6 +245,16 @@ pub fn id(p: &Player) -> String {
 pub fn player(server: &Server, id: &str) -> Option<Player> {
     uuid::parse(id).and_then(|id| server.get_player_by_uuid(id))
 }
+/// Whether `reader` ignores `sender`: the ignore script's answer over ipc (`sp-social`, contract `ignore/1`). No
+/// such script on the server, or a sender who cannot be ignored: nobody ignores.
+#[cfg(target_arch = "wasm32")]
+pub fn ignored(reader: &Player, sender: &Player) -> bool {
+    sp_social::runtime::ignores(sp_social::runtime::id(reader), sender)
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub fn ignored(_reader: &Player, _sender: &Player) -> bool {
+    false
+}
 pub fn visible(server: &Server, viewer: &Player, other: &Player) -> bool {
     player(server, &id(other)).is_some_and(|other| viewer.can_see_player(other))
 }
@@ -280,8 +290,12 @@ pub fn roles<'a>(r: &Request, from: &'a Player, to: &'a Player) -> (&'a Player, 
     }
 }
 pub fn notify(shared: &Shared, server: &Server, r: &Request, key: &str) {
-    // No names here: visibility may have changed since the request was sent.
-    for id in [&r.from, &r.to] {
+    // No names here: visibility may have changed since the request was sent. The recipient of a hidden
+    // request never heard of it, so its end is told to its sender alone.
+    for id in [Some(&r.from), (!r.hidden).then_some(&r.to)]
+        .into_iter()
+        .flatten()
+    {
         if let Some(p) = player(server, id) {
             shared.say(&p, key, &[]);
         }

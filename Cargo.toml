@@ -11,7 +11,16 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-strawberry-plugin-api = { version = "=0.2.1", registry = "strawberry" }
+sp-social = { path = "libs/sp-social" }
+strawberry-plugin-api = { version = "=0.2.2", registry = "strawberry" }
 
 # A repository of its own, not a member of a larger workspace.
 [workspace]
+members = ["libs/sp-social"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

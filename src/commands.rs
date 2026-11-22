@@ -269,18 +269,42 @@ impl Run {
         let to_id = rt::id(&to);
         let my_name = p.get_name();
         let to_name = to.get_name();
+        let now = self.0.now();
+        // After the visibility check: the switch of a hidden player is never revealed.
+        let open = |state: &rt::State| {
+            me == to_id || prefs::parse_uuid(&to_id).is_some_and(|id| state.prefs.enabled(id))
+        };
+        // Whether the request would be sent at all, before another script is asked anything: a refused
+        // request (a cooldown, a second one to the same player) costs no question.
+        let ready = {
+            let state = rt::lock(&self.0.state);
+            if open(&state) {
+                state
+                    .model
+                    .can_send(me, &to_id, now, self.0.config.cooldown_ms)
+            } else {
+                Err(model::Error::Disabled)
+            }
+        };
+        if let Err(e) = ready {
+            rt::error(&self.0, p, e);
+            return;
+        }
+        // A recipient who ignores the sender is never told of the request. The sender sees it sent and, later,
+        // expired, exactly like one that was never answered: nobody learns that he is ignored. Asked outside
+        // the lock.
+        let hidden = rt::ignored(&to, p);
         let sent = {
             let mut state = rt::lock(&self.0.state);
-            // After the visibility check: the switch of a hidden player is never revealed.
-            let open = prefs::parse_uuid(&to_id).is_some_and(|id| state.prefs.enabled(id));
-            if open || me == to_id {
-                state.model.send(
+            if open(&state) {
+                state.model.send_as(
                     (me, &my_name),
                     (&to_id, &to_name),
                     kind,
-                    self.0.now(),
+                    now,
                     self.0.config.expiry_ms,
                     self.0.config.cooldown_ms,
+                    hidden,
                 )
             } else {
                 Err(model::Error::Disabled)
@@ -298,7 +322,9 @@ impl Run {
         {
             self.0.say(&sender, "expired", &[]);
         }
-        self.announce(&to, &sent.request, &my_name);
+        if !sent.request.hidden {
+            self.announce(&to, &sent.request, &my_name);
+        }
         self.0.say(p, "sent", &[&to_name]);
         rt::arm(&self.0, server);
     }

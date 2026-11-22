@@ -1,0 +1,14 @@
+[package]
+name = "sp-social"
+version = "0.1.0"
+edition = "2024"
+description = "Strawberry library: the two small contracts between the message scripts over ipc (who ignores whom, who is a social spy), with the one encoding of a player id."
+authors = ["Strawberry Interactive LLC"]
+license = "LicenseRef-Strawberry-Source-Available-1.0"
+publish = false
+
+[dependencies]
+strawberry-plugin-api = { version = "=0.2.2", registry = "strawberry" }
+
+[lints]
+workspace = true

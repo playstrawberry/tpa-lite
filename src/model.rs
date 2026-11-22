@@ -40,6 +40,9 @@ pub struct Request {
     pub kind: Kind,
     pub expires: u64,
     pub phase: Phase,
+    /// The recipient ignores the sender: the request exists for its sender alone. He sees it sent, waiting
+    /// and expiring like any other; the recipient is never told of it and cannot answer it.
+    pub hidden: bool,
 }
 
 impl Request {
@@ -119,7 +122,62 @@ impl Model {
         self.next = seed;
     }
 
-    /// `from` and `to` are (uuid, name). Every refusal leaves the state as it was.
+    /// Whether a request may be sent now, and the waiting request it would push out. Changes nothing. A
+    /// hidden request counts for its sender (one per pair, his limit, his cooldown) and never for its
+    /// recipient: it takes no place in his list and pushes nothing out.
+    fn admit(
+        &self,
+        from: &str,
+        to: &str,
+        now: u64,
+        cooldown: u64,
+        hidden: bool,
+    ) -> Result<Option<u64>, Error> {
+        if from == to {
+            return Err(Error::SelfRequest);
+        }
+        let mut outgoing = 0;
+        let mut waiting = 0;
+        let mut oldest = None;
+        for r in self.requests.values() {
+            if r.from == from {
+                if r.to == to {
+                    return Err(Error::AlreadySent);
+                }
+                outgoing += 1;
+            }
+            if r.to == to && r.phase == Phase::Waiting && !r.hidden {
+                waiting += 1;
+                oldest.get_or_insert(r.id);
+            }
+        }
+        if outgoing >= self.limit {
+            return Err(Error::Busy);
+        }
+        if let Some(until) = self.cooldowns.get(from).filter(|until| **until > now) {
+            return Err(Error::Cooldown(until - now));
+        }
+        let evict = oldest.filter(|_| !hidden && waiting >= self.limit);
+        let live = self
+            .cooldowns
+            .values()
+            .filter(|until| **until > now)
+            .count();
+        if self.requests.len() - usize::from(evict.is_some()) >= MAX_REQUESTS
+            || (cooldown > 0 && live >= MAX_COOLDOWNS)
+        {
+            return Err(Error::Full);
+        }
+        Ok(evict)
+    }
+
+    /// The refusal a request from `from` to `to` would get now, if any. Changes nothing.
+    pub fn can_send(&self, from: &str, to: &str, now: u64, cooldown: u64) -> Result<(), Error> {
+        self.admit(from, to, now, cooldown, false).map(|_| ())
+    }
+
+    /// A request that is not hidden: the tests' short form of [`Self::send_as`].
+    #[cfg(test)]
     pub fn send(
         &mut self,
         from: (&str, &str),
@@ -129,38 +187,25 @@ impl Model {
         ttl: u64,
         cooldown: u64,
     ) -> Result<Sent, Error> {
-        if from.0 == to.0 {
-            return Err(Error::SelfRequest);
-        }
-        let mut outgoing = 0;
-        let mut waiting = 0;
-        let mut oldest = None;
-        for r in self.requests.values() {
-            if r.from == from.0 {
-                if r.to == to.0 {
-                    return Err(Error::AlreadySent);
-                }
-                outgoing += 1;
-            }
-            if r.to == to.0 && r.phase == Phase::Waiting {
-                waiting += 1;
-                oldest.get_or_insert(r.id);
-            }
-        }
-        if outgoing >= self.limit {
-            return Err(Error::Busy);
-        }
-        self.cooldowns.retain(|_, until| *until > now);
-        if let Some(until) = self.cooldowns.get(from.0) {
-            return Err(Error::Cooldown(until - now));
-        }
-        let evict = oldest.filter(|_| waiting >= self.limit);
-        if self.requests.len() - usize::from(evict.is_some()) >= MAX_REQUESTS
-            || (cooldown > 0 && self.cooldowns.len() >= MAX_COOLDOWNS)
-        {
-            return Err(Error::Full);
-        }
+        self.send_as(from, to, kind, now, ttl, cooldown, false)
+    }
+
+    /// `from` and `to` are (uuid, name); `hidden` when the recipient ignores the sender. Every refusal leaves
+    /// the state as it was.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_as(
+        &mut self,
+        from: (&str, &str),
+        to: (&str, &str),
+        kind: Kind,
+        now: u64,
+        ttl: u64,
+        cooldown: u64,
+        hidden: bool,
+    ) -> Result<Sent, Error> {
+        let evict = self.admit(from.0, to.0, now, cooldown, hidden)?;
         self.next = self.next.checked_add(1).ok_or(Error::Full)?;
+        self.cooldowns.retain(|_, until| *until > now);
         let evicted = evict.and_then(|id| self.remove(id));
         let request = Request {
             id: self.next,
@@ -175,6 +220,7 @@ impl Model {
                 now.saturating_add(ttl)
             },
             phase: Phase::Waiting,
+            hidden,
         };
         if cooldown > 0 {
             self.cooldowns
@@ -196,7 +242,7 @@ impl Model {
         let mut waiting = self
             .requests
             .values()
-            .filter(|r| r.to == to && r.phase == Phase::Waiting);
+            .filter(|r| r.to == to && r.phase == Phase::Waiting && !r.hidden);
         let one = match pick {
             Pick::All => {
                 let all: Vec<_> = waiting.filter(|r| now < r.expires).cloned().collect();
@@ -215,7 +261,7 @@ impl Model {
 
     fn check(&self, to: &str, id: u64, now: u64) -> Result<Request, Error> {
         let r = self.requests.get(&id).ok_or(Error::Missing)?;
-        if r.to != to || r.phase != Phase::Waiting {
+        if r.to != to || r.phase != Phase::Waiting || r.hidden {
             return Err(Error::Missing);
         }
         Self::live(r, now)
@@ -286,7 +332,8 @@ impl Model {
             .cloned()
             .collect()
     }
-    /// The requests still waiting on this recipient, oldest first.
+    /// The requests still waiting on this recipient, oldest first, the hidden ones too: when he switches
+    /// requests off, their senders are told like any other.
     pub fn waiting(&self, to: &str) -> Vec<Request> {
         self.requests
             .values()
@@ -679,5 +726,67 @@ mod tests {
         assert_eq!(m.send(A, B, Kind::To, 0, 1, 1), Err(Error::Full));
         assert!(m.requests.is_empty());
         assert!(m.involving("a").is_empty());
+    }
+    #[test]
+    fn a_hidden_request_exists_for_its_sender_alone() {
+        const D: (&str, &str) = ("d", "Dee");
+        const E: (&str, &str) = ("e", "Eda");
+        const F: (&str, &str) = ("f", "Fox");
+        let mut m = Model::new(2);
+        // Bo ignores Alex. Asking whether it could be sent changes nothing.
+        assert_eq!(m.can_send("a", "b", 100, 30_000), Ok(()));
+        assert!(m.requests.is_empty());
+        let hidden = m
+            .send_as(A, B, Kind::To, 100, 60_000, 30_000, true)
+            .unwrap()
+            .request;
+        assert!(hidden.hidden);
+        // Bo cannot see it or answer it, by any way of naming it.
+        for pick in [
+            Pick::Newest,
+            Pick::All,
+            Pick::Name("alex"),
+            Pick::Id(hidden.id),
+        ] {
+            assert_eq!(m.pick("b", pick, 200), Err(Error::Missing));
+        }
+        assert_eq!(m.take("b", hidden.id, 200), Err(Error::Missing));
+        assert_eq!(
+            m.accept("b", hidden.id, 200, 0, loc(), 7),
+            Err(Error::Missing)
+        );
+        // For Alex it is a request like any other: one to Bo, his cooldown, his list, its expiry.
+        assert_eq!(
+            m.send(A, B, Kind::Here, 200, 60_000, 0),
+            Err(Error::AlreadySent)
+        );
+        assert_eq!(
+            m.can_send("a", "c", 200, 30_000),
+            Err(Error::Cooldown(29_900))
+        );
+        assert_eq!(m.outgoing("a", None), vec![hidden.clone()]);
+        assert!(m.due(60_100).iter().any(|r| r.id == hidden.id));
+        // It takes no place in Bo's list: two real requests fit beside it, and a third pushes out the oldest
+        // real one, never the hidden one.
+        m.send(C, B, Kind::To, 300, 60_000, 0).unwrap();
+        assert_eq!(
+            m.send(D, B, Kind::To, 300, 60_000, 0).unwrap().evicted,
+            None
+        );
+        let third = m.send(E, B, Kind::To, 300, 60_000, 0).unwrap();
+        assert_eq!(third.evicted.map(|r| r.from), Some("c".to_owned()));
+        // A hidden request pushes nothing out of a full list.
+        let second = m.send_as(F, B, Kind::To, 300, 60_000, 0, true).unwrap();
+        assert_eq!(second.evicted, None);
+        let seen: Vec<_> = m
+            .pick("b", Pick::All, 400)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.from)
+            .collect();
+        assert_eq!(seen, ["d", "e"]);
+        // When Bo switches requests off or leaves, every sender is told, the hidden ones too.
+        assert_eq!(m.waiting("b").len(), 4);
+        assert_eq!(m.leave("b").len(), 4);
     }
 }
